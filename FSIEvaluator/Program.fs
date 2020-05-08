@@ -8,7 +8,6 @@ open System.Net
 open System
 open System.IO
 open System.Text
-open FSharp.Compiler.Interactive
 open System.IO.Pipes
 
 module IO =
@@ -130,13 +129,22 @@ and typeStr (typ: Type) =
 /// Evaluate expression & return the result
 let evalExpression text =
     let result, warnings = fsiSession.EvalExpressionNonThrowing text
+    let warningStr =
+        match warnings with
+        | [||] -> ""
+        | _ ->
+            let inner =
+                warnings |> Seq.map (fun warn ->
+                    sprintf "⚠️ %s" warn.Message
+                ) |> String.concat "\n"
+            sprintf "<b>WARNINGS</b>\n%s" %inner
     match result with
     | Choice1Of2 (Some value) ->
-        sprintf "<pre>%s</pre><i>%s</i>" %value.ReflectionValue %value.ReflectionType
+        sprintf "Result:<pre>%s</pre>Type:<pre>%s</pre>%s" %(sprintf "%A" value.ReflectionValue) %(typeStr <| value.ReflectionType) warningStr
     | Choice1Of2 None ->
         "I evaluated this, but couldn't make any sense of the result!  What funny thing have you typed in?"
     | Choice2Of2 e ->
-        sprintf "<b>Exception</b>\n<i>%s</i>" %e.Message
+        sprintf "<b>Exception</b>\n<i>%s</i>\n%s" %e.Message warningStr
 
 let runPipe handle =
     let client = new NamedPipeClientStream(".", handle, PipeDirection.InOut, PipeOptions.None)
