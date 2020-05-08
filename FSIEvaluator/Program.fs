@@ -66,7 +66,66 @@ let args = [| "dotnet"; "fsi"; "--noninteractive" |]
 let fsiConfig = FsiEvaluationSession.GetDefaultConfiguration()
 let fsiSession = FsiEvaluationSession.Create(fsiConfig, args, inStream, outStream, errStream)
 
-let (~%) s = WebUtility.HtmlEncode (sprintf "%A" s)
+let (~%) (s : string) = WebUtility.HtmlEncode s
+
+// next 2 are (largely) taken from https://stackoverflow.com/a/51828781 .
+let rec (|TFunc|_|) (typ: Type) =
+    if typ.IsGenericType && typ.GetGenericTypeDefinition () = typeof<int->int>.GetGenericTypeDefinition () then
+        match typ.GetGenericArguments() with
+        | [|targ1; targ2|] -> Some (targ1, targ2)
+        | _ -> None
+    else
+        None
+
+and (|TList|_|) (typ:Type) =
+    if typ.IsGenericType && typ.GetGenericTypeDefinition () = typeof<List<int>>.GetGenericTypeDefinition () then
+        match typ.GetGenericArguments () with
+        | [|p|] -> Some p
+        | _ -> None
+    else None
+
+and (|TOption|_|) (typ:Type) =
+    if typ.IsGenericType && typ.GetGenericTypeDefinition () = typeof<Option<int>>.GetGenericTypeDefinition () then
+        match typ.GetGenericArguments () with
+        | [|p|] -> Some p
+        | _ -> None
+    else None
+
+and (|TTuple|_|) =
+    let t2 = typeof<Tuple<int,int>>.GetGenericTypeDefinition ()
+    let t3 = typeof<Tuple<int,int,int>>.GetGenericTypeDefinition ()
+    let t4 = typeof<Tuple<int,int,int,int>>.GetGenericTypeDefinition ()
+    let t5 = typeof<Tuple<int,int,int,int,int>>.GetGenericTypeDefinition ()
+    fun (typ:Type) -> 
+        if typ.IsGenericType then
+            let gtd = typ.GetGenericTypeDefinition ()
+            if gtd = t2 || gtd = t3 || gtd = t4 || gtd = t5 then
+                match typ.GetGenericArguments () with
+                | [|a;b|] -> Some [a;b]
+                | [|a;b;c|] -> Some [a;b;c]
+                | [|a;b;c;d|] -> Some [a;b;c;d]
+                | [|a;b;c;d;e|] -> Some [a;b;c;d;e]
+                | _ -> None
+            else None
+        else None
+
+and typeStr (typ: Type) =
+    match typ with
+    | TFunc (t1, t2) when t1.IsGenericType -> sprintf "(%s) 🡲 %s" (typeStr t1) (typeStr t2)
+    | TFunc (t1, t2) -> sprintf "%s 🡲 %s" (typeStr t1) (typeStr t2)
+    | TList p -> sprintf "%s list" (typeStr p)
+    | TOption p -> sprintf "%s option" (typeStr p)
+    | TTuple [a;b] -> sprintf "%s * %s" (typeStr a) (typeStr b)
+    | TTuple [a;b;c] -> sprintf "%s * %s * %s" (typeStr a) (typeStr b) (typeStr c)
+    | TTuple [a;b;c;d] -> sprintf "%s * %s * %s * %s" (typeStr a) (typeStr b) (typeStr c) (typeStr d)
+    | TTuple [a;b;c;d;e] -> sprintf "%s * %s * %s * %s * %s" (typeStr a) (typeStr b) (typeStr c) (typeStr d) (typeStr e)
+    | typ when typ = typeof<int> -> "int"
+    | typ when typ = typeof<string> -> "string"
+    | typ when typ = typeof<unit> -> "unit"
+    | typ when typ = typeof<bool> -> "bool"
+    | typ when typ = typeof<float> -> "float"
+    | typ when typ.IsGenericParameter -> sprintf "'%s" (string typ)
+    | typ -> if typ.IsGenericType then sprintf "(%O)" typ else string typ
 
 /// Evaluate expression & return the result
 let evalExpression text =
