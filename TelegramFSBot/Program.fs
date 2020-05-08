@@ -223,9 +223,6 @@ let pipeServer : MailboxProcessor<string * AsyncReplyChannel<string>> =
         loop <| pipeServer ()
     )
 
-// -----------------------------------------------------------------------------------------
-
-
 // -------------------------------------------------------------------------------
 
 let config =
@@ -239,26 +236,118 @@ let config =
         Token = System.IO.File.ReadAllText path
     }
 
+type ResponseType =
+| AsReply
+| AsMessage
+
+let greetingWithTime () =
+    match DateTime.Now.Hour with
+    | 5 | 6 | 7 | 8 | 9 | 10 | 11 -> "Good morning"
+    | 12 | 13 | 14 | 15 | 16 | 17 -> "Good afternoon"
+    | 18 | 19 -> "Hello"
+    | 20 | 21 | 22 | 23 -> "Good evening"
+    | 0 | 1 | 2 | 3 | 4 -> "Good night 💤 (or early morning?)"
+    | _ -> "Wotcher"
+
+let normalMessage text (user:User) say =
+    async {
+        let! evaluation =
+            pipeServer.PostAndTryAsyncReply((fun reply -> text, reply), 5500)
+        let output =
+            match evaluation with
+            | None ->
+                say <| sprintf "Sorry, %s, I'm taking a bit long to evaluate this code.  Are you sure you don't have an infinite loop somewhere inside it?" user.FirstName
+            | Some v ->
+                say v
+        return output
+    } |> Async.RunSynchronously
+
+let startMessage (user:User) say =
+    //say <| sprintf "%s, %s.  I'm here to help you with your functional programming.  By default, I will take F# code that you give me, evaluate it, and give you the result.  But I can do some other things, too!\n\n👋 <b>/start</b> will display this message\n👋 <b>/question</b> puts me into a question-and-answer mode, where I will give you small problems to solve\n👋 <b>/learn</b> puts me into \"learning\" mode, where <i>you</i> 💪 can teach me 🤖\n👋 <b>/eval</b> puts me into the default mode, where you can type code and have it evaluated by me.\n👋 <b>/help</b> gives you more information about the mode I'm in\n👋 <b>/about</b> tells you more about me." (greetingWithTime ()) user.FirstName
+    say <| sprintf "%s, %s.  I'm here to help you with your functional programming.  By default, I will take F# code that you give me, evaluate it, and give you the result.  But I can do some other things, too!\n\n👋 <b>/start</b> will display this message\n👋 <b>/question</b> puts me into a question-and-answer mode, where I will give you small problems to solve\n👋 <b>/eval</b> puts me into the default mode, where you can type code and have it evaluated by me.\n👋 <b>/about</b> tells you more about me." (greetingWithTime ()) user.FirstName
+
+let aboutMessage (user:User) say =
+    say <| sprintf "Oh, %s, I hate to talk about myself!  But if you insist...\n\nI was born in a small Integrated Development Environment not far from here, and had a happy childhood where I spent most of my time playing with the lambdas, climbing the higher-order functions, and growing some monads in my back-yard.  I am written in F#, of course, and have been blessed to have wonderful godparents like Funogram and FSharp.Compiler.Service, both of whom I depend on quite heavily.  If you have any questions, suggestions, compliments, or complaints about me, you may direct them to my parent, <a href=\"tg://user?id=924587038\">🧎🏾</a>, who has made me into the bot I am today.  (Just click on his emoji and you can start a conversation with him)" user.FirstName
+
+let questionMessage (answer:string option) (user:User) say =
+    match answer with
+    | None ->
+        say <| DB.getQuestion user.Id
+    | Some answer ->
+        if String.IsNullOrWhiteSpace answer then
+            say <| "Sorry, I didn't quite catch that?"
+        else
+            let assess expected pass =
+                let passed = List.exists pass expected
+                let modelAnswer = List.head expected
+                if passed then
+                    DB.markCorrect user.Id
+                    say <| sprintf "<b>CORRECT!</b>\n<i>%s</i> was the expected answer.\n\n%s" %modelAnswer %(DB.getQuestion user.Id)
+                else
+                    say <| sprintf "Sorry, %s, that's not the answer that I was looking for.  Try again?" %user.FirstName
+            match DB.getAnswer user.Id with
+            | Some (ShortAnswer, expected) ->
+                assess expected <| (fun e -> answer.Trim() = e)
+            | Some (WhitespaceInsensitive, expected) ->
+                assess expected <| fun e -> answer.Replace(" ","") = e.Replace(" ","")
+            | None ->
+                // I don't have any question down for this user, so let's ask one.
+                // We take this branch in /question mode, when all questions have been
+                // answered, and the user then says something.
+                say <| DB.getQuestion user.Id
+
+let parseAndInsert text (user:User) say =
+    match Parsing.parse text with
+    | Ok (i,q,a) ->
+        DB.addQuestion i q a user.Id
+        say <| "Question added, thank you!"
+    | Error e ->
+        say <| sprintf "Error during parse: <i>%s</i>" %e
+
 let updateArrived (context : UpdateContext) =
     let response =
         maybe {
             let! msg = context.Update.Message |> Option.orElse context.Update.EditedMessage
             let! text = msg.Text
             let! user = msg.From
-            let userId = user.Id
-            let say text =
-                sendMessageBase (ChatId.Int userId) text (Some ParseMode.HTML) None None (Some msg.MessageId) None
+            let mode = DB.getMode user.Id // invoked for side-effect (!!!)
+            let say replyType text =
+                let replyType =
+                    match replyType with
+                    | AsReply -> Some msg.MessageId
+                    | AsMessage -> None
+                sendMessageBase (ChatId.Int user.Id) text (Some ParseMode.HTML) None None replyType None
+            let output =
+                match text with
+                | "/start" -> startMessage user (say AsMessage)
+                | "/about" -> aboutMessage user (say AsMessage)
+(*
+                | "/learn" ->
+                    DB.setMode user.Id Learning
+*)
+                | "/question" ->
+                    DB.setMode user.Id QA
+                    questionMessage None user (say AsMessage)
+                | "/eval" ->
+                    DB.setMode user.Id Evaluating
+                    say AsMessage "Evaluation mode is active, thank you.  I will evaluate all of your messages as code."
+                | "/help" -> say AsMessage "NOT IMPLEMENTED YET!"
+                | "/train" ->
+                    if user.Id = 924587038L || user.Id = 924171662L || user.Id = 1011333639L || user.Id = 1264691500L then
+                        DB.setMode user.Id Training
+                        say AsMessage "Mega-thrusters are GO!"
+                    else
+                        say AsMessage "Naughty, naughty ... YOU shouldn't be trying THAT mode.  How did you even find out about it, I wonder? 🤔"
+                | _ ->
+                    match mode with
+                    | Learning -> say AsMessage "NOT IMPLEMENTED YET!"
+                    | QA -> questionMessage (Some text) user (say AsReply)
+                    | Training -> parseAndInsert text user (say AsReply)
+                    | Evaluating ->
+                        normalMessage text user (say AsReply)
             let evaluatorComputation =
                 async {
-                    let! evaluation =
-                        pipeServer.PostAndTryAsyncReply((fun reply -> text, reply), 5500)
-                    let statement =
-                        match evaluation with
-                        | None ->
-                            say <| sprintf "Sorry, %s, I'm taking a bit long to evaluate this code.  Are you sure you don't have an infinite loop somewhere inside it?" user.FirstName
-                        | Some v ->
-                            say v
-                    let! result = api config statement
+                    let! result = api config output
                     match result with
                     | Ok _ -> ()
                     | Error e ->
