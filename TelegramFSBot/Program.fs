@@ -38,18 +38,19 @@ with
 type Answer =
 | WhitespaceInsensitive
 | ShortAnswer
-//| EvaluatedType
-//| EvaluatedCode
+| CodeAnswer
 with
     static member ofInt integer =
         match integer with
         | 0s -> WhitespaceInsensitive
         | 1s -> ShortAnswer
+        | 2s -> CodeAnswer
         | _ -> failwithf "%d is not a valid Mode value" integer
     member __.toInt =
         match __ with
         | WhitespaceInsensitive -> 0s
         | ShortAnswer -> 1s
+        | CodeAnswer -> 2s
 
 let (~%) (s : string) = System.Net.WebUtility.HtmlEncode s
 
@@ -61,17 +62,26 @@ module Parsing =
         >>. skipRestOfLine true
         >>. charsTillStringCI "]]!" true 3000
         .>>. restOfLine true
-        |>> (fun (q,a) -> ShortAnswer, q.Trim(), a.Trim())
+        |>> (fun (q,a) -> ShortAnswer, q.Trim(), None, a.Trim())
 
     let whitespaceInsensitive =
         pstringCI "ignore whitespace"
         >>. skipRestOfLine true
         >>. charsTillStringCI "]]!" true 3000
         .>>. restOfLine true
-        |>> (fun (q,a) -> WhitespaceInsensitive, q.Trim(), a.Trim())
+        |>> (fun (q,a) -> WhitespaceInsensitive, q.Trim(), None, a.Trim())
+
+    let code =
+        pstringCI "code"
+        >>. skipChar ' '
+        >>. pint32
+        .>> skipRestOfLine true
+        .>>. charsTillStringCI "]]!" true 3000
+        .>>. restOfLine true
+        |>> (fun ((n,q),a) -> CodeAnswer, q.Trim(), Some n, a.Trim())
 
     let parse txt =
-        let parser = short <|> whitespaceInsensitive
+        let parser = short <|> whitespaceInsensitive <|> code
         match run parser txt with
         | Success (v,_,_) -> Result.Ok v
         | Failure (s,_,_) -> Result.Error s
@@ -129,22 +139,28 @@ module DB =
         transact.Commit ()
 
     let getAnswer (userId:int64) =
-        use cmd = new NpgsqlCommand(@"select answer, interpretation from questions,users where questions.id = users.question and userid = @id", conn)
+        use cmd = new NpgsqlCommand(@"select answer, interpretation, ""nInputs"" from questions,users where questions.id = users.question and userid = @id", conn)
         ignore <| cmd.Parameters.AddWithValue("@id", userId)
         using (cmd.ExecuteReader ()) (fun reader ->
             if reader.Read () = false then
                 None
             else
-                let (answer:string,interpretation:int16) = unbox reader.[0], unbox reader.[1]
-                let answers = answer.Split("~") |> Seq.toList |> List.map (fun v -> v.Trim ())
-                Some (Answer.ofInt interpretation, answers)
+                let (answer:string,interpretation:int16,nInputs:int16) =
+                    unbox reader.[0], unbox reader.[1], unbox reader.[2]
+                match Answer.ofInt interpretation with
+                | (ShortAnswer | WhitespaceInsensitive) as a ->
+                    let answerList = answer.Split("~") |> Seq.toList |> List.map (fun v -> v.Trim ())
+                    Some (a, answerList, 0)
+                | CodeAnswer ->
+                    Some (Answer.ofInt interpretation, [answer], int nInputs)
         )
 
-    let addQuestion (i:Answer) q a userId =
-        use cmd = new NpgsqlCommand(@"insert into questions (question, answer, interpretation, submitter) values (@q, @a, @i, @s)", conn)
+    let addQuestion (i:Answer) q a n userId =
+        use cmd = new NpgsqlCommand(@"insert into questions (question, answer, interpretation, ""nInputs"", submitter) values (@q, @a, @i, @n, @s)", conn)
         ignore <| cmd.Parameters.AddWithValue("@q", q)
         ignore <| cmd.Parameters.AddWithValue("@a", a)
         ignore <| cmd.Parameters.AddWithValue("@i", i.toInt)
+        ignore <| cmd.Parameters.AddWithValue("@n", defaultArg n 0)
         ignore <| cmd.Parameters.AddWithValue("@s", userId)
         match cmd.ExecuteNonQuery () with
         | 1 -> ()
@@ -249,18 +265,27 @@ let greetingWithTime () =
     | 0 | 1 | 2 | 3 | 4 -> "Good night 💤 (or early morning?)"
     | _ -> "Wotcher"
 
+let isMaybeBad = // ... because a real check would involve actually having to parse ...
+    // ... I'm going to go to infosec hell because of this.  Oh yes, I am...
+    let badness = ["Accessibility"; "Microsoft"; "System"; "UIAutomationClientsideProviders"; "fprintf"]
+    fun (code:string) ->
+        badness |> List.exists code.Contains
+    
 let normalMessage text (user:User) say =
-    async {
-        let! evaluation =
-            pipeServer.PostAndTryAsyncReply((fun reply -> text, reply), 5500)
-        let output =
-            match evaluation with
-            | None ->
-                say <| sprintf "Sorry, %s, I'm taking a bit long to evaluate this code.  Are you sure you don't have an infinite loop somewhere inside it?" user.FirstName
-            | Some v ->
-                say v
-        return output
-    } |> Async.RunSynchronously
+    if isMaybeBad text then
+        say <| sprintf "Sorry, %s, I can't run this code.  Are you using any code from namespaces (Accessibility, Microsoft.*, or System.*)?  If so, that might be why I can't run it." user.FirstName
+    else
+        async {
+            let! evaluation =
+                pipeServer.PostAndTryAsyncReply((fun reply -> text, reply), 5500)
+            let output =
+                match evaluation with
+                | None ->
+                    say <| sprintf "Sorry, %s, I'm taking a bit long to evaluate this code.  Are you sure you don't have an infinite loop somewhere inside it?" user.FirstName
+                | Some v ->
+                    say v
+            return output
+        } |> Async.RunSynchronously
 
 let startMessage (user:User) say =
     //say <| sprintf "%s, %s.  I'm here to help you with your functional programming.  By default, I will take F# code that you give me, evaluate it, and give you the result.  But I can do some other things, too!\n\n👋 <b>/start</b> will display this message\n👋 <b>/question</b> puts me into a question-and-answer mode, where I will give you small problems to solve\n👋 <b>/learn</b> puts me into \"learning\" mode, where <i>you</i> 💪 can teach me 🤖\n👋 <b>/eval</b> puts me into the default mode, where you can type code and have it evaluated by me.\n👋 <b>/help</b> gives you more information about the mode I'm in\n👋 <b>/about</b> tells you more about me." (greetingWithTime ()) user.FirstName
@@ -268,6 +293,31 @@ let startMessage (user:User) say =
 
 let aboutMessage (user:User) say =
     say <| sprintf "Oh, %s, I hate to talk about myself!  But if you insist...\n\nI was born in a small Integrated Development Environment not far from here, and had a happy childhood where I spent most of my time playing with the lambdas, climbing the higher-order functions, and growing some monads in my back-yard.  I am written in F#, of course, and have been blessed to have wonderful godparents like Funogram and FSharp.Compiler.Service, both of whom I depend on quite heavily.  If you have any questions, suggestions, compliments, or complaints about me, you may direct them to my parent, <a href=\"tg://user?id=924587038\">🧎🏾</a>, who has made me into the bot I am today.  (Just click on his emoji and you can start a conversation with him)" user.FirstName
+
+let makeCheckTemplate =
+    let args =
+        "abcdefghijklmnopqrstuvwxyz"
+        |> Seq.map string
+        |> Seq.toList
+    fun theirs mine nParams ->
+        let sb = new System.Text.StringBuilder();
+        let indent n v =
+            use sr = new System.IO.StringReader(v)
+            use sw = new System.IO.StringWriter(sb.Clear())
+            let indent = String.replicate n "  ";
+            let rec doWrite = function
+                | null ->
+                    sw.Flush ()
+                    sb.ToString ()
+                | v ->
+                    sw.WriteLine(indent + v)
+                    doWrite <| sr.ReadLine ()
+            doWrite <| sr.ReadLine ()
+        let inputs = args |> List.take nParams |> String.concat " "
+        sprintf "let expecto =\n%s  in\n    let patronum =\n%s      in Check.One({ Config.QuickThrowOnFailure with MaxTest=1000 }, fun %s -> expecto %s = patronum %s)"
+            (indent 1 mine)
+            (indent 3 theirs)
+            inputs inputs inputs
 
 let questionMessage (answer:string option) (user:User) say =
     match answer with
@@ -286,10 +336,35 @@ let questionMessage (answer:string option) (user:User) say =
                 else
                     say <| sprintf "Sorry, %s, that's not the answer that I was looking for.  Try again?" %user.FirstName
             match DB.getAnswer user.Id with
-            | Some (ShortAnswer, expected) ->
+            | Some (ShortAnswer, expected, _) ->
                 assess expected <| (fun e -> answer.Trim() = e)
-            | Some (WhitespaceInsensitive, expected) ->
+            | Some (WhitespaceInsensitive, expected, _) ->
                 assess expected <| fun e -> answer.Replace(" ","") = e.Replace(" ","")
+            | Some (CodeAnswer, [expected], nInputs) ->
+                if isMaybeBad answer then
+                    say <| "I couldn't evaluate this code.  It shouldn't contain any namespaces (e.g. System.*)."
+                else
+                    async {
+                        let! evaluation =
+                            pipeServer.PostAndTryAsyncReply((fun reply -> makeCheckTemplate answer expected (int nInputs), reply), 5500)
+                        let output =
+                            match evaluation with
+                            | None ->
+                                say <| sprintf "Sorry, %s, I'm taking a bit long to evaluate this code.  Are you sure you don't have an infinite loop somewhere inside it?" user.FirstName
+                            | Some v ->
+                                if v.Contains "Exception" then
+                                    if v.Contains "Falsifiable" then
+                                        say <| sprintf "Sorry, that didn't work.  I've included the error output below.  Take a look at the end of the output, and you'll see the test-case input that caused your code to fail.\n\n%s" v
+                                    else
+                                        say <| sprintf "There was a problem running your code.  Does your function have the correct type?  Did you make any typos?\n\n%s" v
+                                else
+                                    DB.markCorrect user.Id
+                                    say <| sprintf "<b>CORRECT!</b>\n<pre>%s</pre> is correct, to the best of my knowledge (I ran 1,000 random tests with it, and it passed all of them!).\n\n%s" %answer %(DB.getQuestion user.Id)
+
+                        return output
+                    } |> Async.RunSynchronously
+            | Some (CodeAnswer, _, _) ->
+                say <| "Sorry, an internal error occurred.  Please use the /about command and contact the developer to let him know about this.  A screenshot of what you said to the bot will be very helpful!"
             | None ->
                 // I don't have any question down for this user, so let's ask one.
                 // We take this branch in /question mode, when all questions have been
@@ -298,8 +373,8 @@ let questionMessage (answer:string option) (user:User) say =
 
 let parseAndInsert text (user:User) say =
     match Parsing.parse text with
-    | Ok (i,q,a) ->
-        DB.addQuestion i q a user.Id
+    | Ok (i,q,n,a) ->
+        DB.addQuestion i q a n user.Id
         say <| "Question added, thank you!"
     | Error e ->
         say <| sprintf "Error during parse: <i>%s</i>" %e

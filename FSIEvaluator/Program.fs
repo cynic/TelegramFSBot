@@ -5,7 +5,6 @@ open FSharp.Compiler.Interactive.Shell
 open FSharp.Compiler.SourceCodeServices
 open System.Net
 
-open System
 open System.IO
 open System.Text
 open System.IO.Pipes
@@ -64,6 +63,8 @@ let errStream = new StringWriter(sbErr)
 let args = [| "dotnet"; "fsi"; "--noninteractive" |]
 let fsiConfig = FsiEvaluationSession.GetDefaultConfiguration()
 let fsiSession = FsiEvaluationSession.Create(fsiConfig, args, inStream, outStream, errStream)
+fsiSession.EvalInteraction("#r \"FsCheck.dll\"")
+fsiSession.EvalInteraction("open FsCheck")
 
 let (~%) (s : string) = WebUtility.HtmlEncode s
 
