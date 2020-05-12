@@ -55,7 +55,8 @@ CREATE TABLE public.questions (
     question text NOT NULL,
     answer text NOT NULL,
     interpretation smallint NOT NULL,
-    submitter bigint
+    submitter bigint,
+    "nInputs" smallint DEFAULT 0 NOT NULL
 );
 
 
